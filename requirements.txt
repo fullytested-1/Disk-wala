@@ -2,3 +2,4 @@ pyrofork
 tgcrypto
 aiohttp
 python-dotenv
+curl_cffi
