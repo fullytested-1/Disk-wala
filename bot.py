@@ -2,6 +2,14 @@ import asyncio
 import os
 import time
 from urllib.parse import quote
+
+# Python 3.12+ ഇഷ്യൂ ഒഴിവാക്കാൻ Pyrogram ഇംപോർട്ടിന് മുൻപ് ലൂപ്പ് സെറ്റ് ചെയ്യുന്നു
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
@@ -122,7 +130,7 @@ async def diskwala_handler(client, message: Message):
 
     start_time = time.time()
     try:
-        # Download
+        # 1. Download
         async with aiohttp.ClientSession() as session:
             async with session.get(download_url) as resp:
                 if resp.status != 200:
@@ -147,7 +155,7 @@ async def diskwala_handler(client, message: Message):
                                 action="Downloading",
                             )
 
-        # Thumbnail
+        # 2. Thumbnail
         if thumb_url:
             async with aiohttp.ClientSession() as session:
                 async with session.get(thumb_url) as t_resp:
@@ -155,7 +163,7 @@ async def diskwala_handler(client, message: Message):
                         with open(thumb_path, "wb") as tf:
                             tf.write(await t_resp.read())
 
-        # Upload
+        # 3. Upload
         await status_msg.edit_text("📤 **ടെലിഗ്രാമിലേക്ക് അപ്‌ലോഡ് ചെയ്യുന്നു...**")
         upload_start = time.time()
         caption = f"🎬 **File Name:** `{filename}`"
