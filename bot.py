@@ -1,19 +1,21 @@
 import asyncio
 import os
+import re
+import shutil
 import time
+import uuid
 from urllib.parse import quote
 
-# Python 3.12+ ഇഷ്യൂ ഒഴിവാക്കാൻ Pyrogram ഇംപോർട്ടിന് മുൻപ് ലൂപ്പ് സെറ്റ് ചെയ്യുന്നു
+# Python 3.12+ ൽ ക്രാഷ് ആവാതിരിക്കാൻ ഇവന്റ് ലൂപ്പ് ഉണ്ടാക്കുന്നു
 try:
     asyncio.get_event_loop()
 except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 
 load_dotenv()
@@ -22,6 +24,8 @@ API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
+
+MAX_SIZE = 2 * 1024 * 1024 * 1024  # 2GB ടെലിഗ്രാം ബോട്ട് പരിധി
 
 if not all([API_ID, API_HASH, BOT_TOKEN]):
     raise ValueError(
@@ -44,35 +48,49 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"Web server started on port {PORT}")
+    print(f"Health server listening on port {PORT}", flush=True)
+    return runner
 
 
-# --- Progress Bar Handler ---
-async def progress(
-    current, total, message: Message, start_time, action="Uploading"
-):
+# --- Progress Bar ---
+_last_edit = {}
+
+
+async def progress(current, total, message: Message, start_time, action="Uploading"):
+    if not total:
+        return
     now = time.time()
+    key = message.id
+    # 5 സെക്കൻഡിൽ ഒരിക്കൽ മാത്രം edit (FloodWait ഒഴിവാക്കാൻ)
+    if current != total and now - _last_edit.get(key, 0) < 5:
+        return
+    _last_edit[key] = now
+
     diff = now - start_time
-    if round(diff % 4.00) == 0 or current == total:
-        percentage = current * 100 / total
-        speed = current / diff if diff > 0 else 0
-        eta = round((total - current) / speed) if speed > 0 else 0
+    percentage = current * 100 / total
+    speed = current / diff if diff > 0 else 0
+    eta = round((total - current) / speed) if speed > 0 else 0
 
-        current_mb = current / (1024 * 1024)
-        total_mb = total / (1024 * 1024)
-        speed_kb = speed / 1024
+    text = (
+        f"⚡ **{action}...**\n"
+        f"📊 **Progress:** `{percentage:.2f}%`\n"
+        f"💾 **Size:** `{current / 1048576:.2f} MB / {total / 1048576:.2f} MB`\n"
+        f"🚀 **Speed:** `{speed / 1024:.2f} KB/s`\n"
+        f"⏱️ **ETA:** `{eta}s`"
+    )
+    try:
+        await message.edit_text(text)
+    except Exception:
+        pass
 
-        text = (
-            f"⚡ **{action}...**\n"
-            f"📊 **Progress:** `{percentage:.2f}%`\n"
-            f"💾 **Size:** `{current_mb:.2f} MB / {total_mb:.2f} MB`\n"
-            f"🚀 **Speed:** `{speed_kb:.2f} KB/s`\n"
-            f"⏱️ **ETA:** `{eta}s`"
-        )
-        try:
-            await message.edit_text(text)
-        except Exception:
-            pass
+
+# --- Helpers ---
+def safe_filename(name: str, ext: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(name)).strip(" .") or "file"
+    ext = re.sub(r"[^a-zA-Z0-9]", "", str(ext or "mp4")).lower() or "mp4"
+    if name.lower().endswith("." + ext):
+        name = name[: -(len(ext) + 1)]
+    return f"{name[:100]}.{ext}"
 
 
 # --- DiskWala API Fetch ---
@@ -85,28 +103,33 @@ async def fetch_diskwala_data(url: str):
         ),
         "Referer": "https://diskwala.net/",
     }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(api_url, headers=headers, timeout=20) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data.get("ok") and data.get("file"):
-                    return data["file"]
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    if data.get("ok") and data.get("file"):
+                        return data["file"]
+    except Exception as e:
+        print(f"API error: {e}", flush=True)
     return None
 
 
-@app.on_message(filters.command("start"))
+# --- Handlers ---
+@app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
     await message.reply_text(
-        "👋 **ഹലോ!**\n\nDiskWala ലിങ്ക് അയക്കൂ, ഫയൽ ഞാൻ direct ആയി അപ്‌ലോഡ് ചെയ്തു തരാം."
+        "👋 **ഹലോ!**\n\nDiskWala ലിങ്ക് അയക്കൂ, ഫയൽ ഞാൻ നേരിട്ട് ഡൗൺലോഡ് ചെയ്ത് അപ്‌ലോഡ് ചെയ്തു തരാം."
     )
 
 
-@app.on_message(filters.text & filters.private)
+@app.on_message(filters.text & filters.private & ~filters.command("start"))
 async def diskwala_handler(client, message: Message):
     user_text = message.text.strip()
 
-    if "diskwala" not in user_text:
+    if "diskwala" not in user_text.lower():
         await message.reply_text("⚠️ സാധുവായ ഒരു DiskWala ലിങ്ക് നൽകുക.")
         return
 
@@ -120,18 +143,23 @@ async def diskwala_handler(client, message: Message):
         return
 
     download_url = file_info["downloadUrl"]
-    filename = (
-        f"{file_info.get('name', 'file')}.{file_info.get('extension', 'mp4')}"
-    )
+    extension = str(file_info.get("extension") or "mp4").lstrip(".").lower()
+    filename = safe_filename(file_info.get("name", "file"), extension)
     thumb_url = file_info.get("thumb")
-    thumb_path = f"thumb_{int(time.time())}.jpg"
+
+    # ഓരോ റിക്വസ്റ്റിനും പ്രത്യേക ഫോൾഡർ
+    work_dir = os.path.join("downloads", uuid.uuid4().hex)
+    os.makedirs(work_dir, exist_ok=True)
+    file_path = os.path.join(work_dir, filename)
+    thumb_path = os.path.join(work_dir, "thumb.jpg")
 
     await status_msg.edit_text(f"📥 **ഡൗൺലോഡ് ആരംഭിക്കുന്നു:** `{filename}`")
 
     start_time = time.time()
     try:
-        # 1. Download
-        async with aiohttp.ClientSession() as session:
+        # 1. ഫയൽ ഡൗൺലോഡ്
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(download_url) as resp:
                 if resp.status != 200:
                     await status_msg.edit_text(
@@ -140,9 +168,14 @@ async def diskwala_handler(client, message: Message):
                     return
 
                 total_size = int(resp.headers.get("content-length", 0))
-                downloaded = 0
+                if total_size > MAX_SIZE:
+                    await status_msg.edit_text(
+                        "❌ ഫയൽ 2GB-യിൽ കൂടുതലാണ്. ടെലിഗ്രാം ബോട്ടിന് ഇത് അപ്‌ലോഡ് ചെയ്യാൻ പറ്റില്ല."
+                    )
+                    return
 
-                with open(filename, "wb") as f:
+                downloaded = 0
+                with open(file_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(1024 * 1024):
                         f.write(chunk)
                         downloaded += len(chunk)
@@ -155,31 +188,36 @@ async def diskwala_handler(client, message: Message):
                                 action="Downloading",
                             )
 
-        # 2. Thumbnail
-        if thumb_url:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(thumb_url) as t_resp:
-                    if t_resp.status == 200:
-                        with open(thumb_path, "wb") as tf:
-                            tf.write(await t_resp.read())
+            # 2. Thumbnail
+            if thumb_url:
+                try:
+                    async with session.get(
+                        thumb_url, timeout=aiohttp.ClientTimeout(total=20)
+                    ) as t_resp:
+                        if t_resp.status == 200:
+                            with open(thumb_path, "wb") as tf:
+                                tf.write(await t_resp.read())
+                except Exception:
+                    pass
 
-        # 3. Upload
+        # 3. ടെലിഗ്രാമിലേക്ക് അപ്‌ലോഡ്
         await status_msg.edit_text("📤 **ടെലിഗ്രാമിലേക്ക് അപ്‌ലോഡ് ചെയ്യുന്നു...**")
         upload_start = time.time()
         caption = f"🎬 **File Name:** `{filename}`"
         thumb_file = thumb_path if os.path.exists(thumb_path) else None
 
-        if file_info.get("extension") in ["mp4", "mkv", "webm", "mov"]:
+        if extension in ["mp4", "mkv", "webm", "mov"]:
             await message.reply_video(
-                video=filename,
+                video=file_path,
                 caption=caption,
                 thumb=thumb_file,
+                supports_streaming=True,
                 progress=progress,
                 progress_args=(status_msg, upload_start, "Uploading Video"),
             )
         else:
             await message.reply_document(
-                document=filename,
+                document=file_path,
                 caption=caption,
                 thumb=thumb_file,
                 progress=progress,
@@ -189,22 +227,27 @@ async def diskwala_handler(client, message: Message):
         await status_msg.delete()
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ **എറർ സംഭവിച്ചു:** `{str(e)}`")
+        try:
+            await status_msg.edit_text(f"❌ **എറർ സംഭവിച്ചു:** `{str(e)}`")
+        except Exception:
+            pass
 
     finally:
-        if os.path.exists(filename):
-            os.remove(filename)
-        if os.path.exists(thumb_path):
-            os.remove(thumb_path)
+        _last_edit.pop(status_msg.id, None)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
-# --- Main Runner ---
+# --- Runner ---
 async def main():
-    await start_web_server()
+    runner = await start_web_server()
+    print("Bot is starting...", flush=True)
     await app.start()
-    print("Bot is up and listening for messages...")
-    await asyncio.Event().wait()
+    print("Bot is up and listening for messages!", flush=True)
+    await idle()
+    await app.stop()
+    await runner.cleanup()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
