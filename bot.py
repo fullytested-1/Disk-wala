@@ -94,8 +94,10 @@ def safe_filename(name: str, ext: str) -> str:
     return f"{name[:100]}.{ext}"
 
 
-# --- DiskWala API Fetch (പല ലിങ്ക് രൂപങ്ങൾ ട്രൈ ചെയ്യും) ---
+# --- DiskWala API Fetch (Cloudflare മറികടക്കാൻ curl_cffi) ---
 async def fetch_diskwala_data(url: str):
+    from curl_cffi.requests import AsyncSession
+
     m = re.search(r"/app/([A-Za-z0-9]+)", url)
     file_id = m.group(1) if m else url.rstrip("/").split("/")[-1]
 
@@ -108,36 +110,30 @@ async def fetch_diskwala_data(url: str):
     ]
 
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
         "Referer": "https://diskwala.net/",
         "Accept": "application/json, text/plain, */*",
     }
 
-    async with aiohttp.ClientSession() as session:
+    async with AsyncSession(impersonate="chrome") as session:
         for cand in candidates:
             api_url = f"https://diskwala.net/web/api/status?link={quote(cand, safe='')}"
             try:
-                async with session.get(
-                    api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)
-                ) as resp:
-                    body = await resp.text()
-                    print(
-                        f"[DEBUG] try={cand} status={resp.status} body={body[:300]}",
-                        flush=True,
-                    )
-                    if resp.status != 200:
-                        continue
-                    data = json.loads(body)
-                    if isinstance(data, dict) and data.get("ok") and data.get("file"):
-                        file_obj = data["file"]
-                        for k in ("downloadUrl", "download_url", "url", "link", "direct"):
-                            if file_obj.get(k):
-                                file_obj["downloadUrl"] = file_obj[k]
-                                break
-                        return file_obj
+                resp = await session.get(api_url, headers=headers, timeout=20)
+                body = resp.text
+                print(
+                    f"[DEBUG] try={cand} status={resp.status_code} body={body[:300]}",
+                    flush=True,
+                )
+                if resp.status_code != 200:
+                    continue
+                data = json.loads(body)
+                if isinstance(data, dict) and data.get("ok") and data.get("file"):
+                    file_obj = data["file"]
+                    for k in ("downloadUrl", "download_url", "url", "link", "direct"):
+                        if file_obj.get(k):
+                            file_obj["downloadUrl"] = file_obj[k]
+                            break
+                    return file_obj
             except Exception as e:
                 print(f"[DEBUG] error try={cand}: {type(e).__name__}: {e}", flush=True)
     return None
